@@ -1,96 +1,169 @@
+#include <iostream>
+#include <string>
+
 #include "opencv2/core/core.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/video/background_segm.hpp"
+#include "opencv2/gpu/gpu.hpp"
 #include "opencv2/highgui/highgui.hpp"
-#include <stdio.h>
 
 using namespace std;
 using namespace cv;
+using namespace cv::gpu;
 
-static void help()
+enum Method
 {
- printf("\nDo background segmentation, especially demonstrating the use of cvUpdateBGStatModel().\n"
-"Learns the background at the start and then segments.\n"
-"Learning is togged by the space key. Will read from file or camera\n"
-"Usage: \n"
-"			./bgfg_segm [--camera]=<use camera, if this key is present>, [--file_name]=<path to movie file> \n\n");
-}
-
-const char* keys =
-{
-    "{c |camera   |true    | use camera or not}"
-    "{fn|file_name|tree.avi | movie file             }"
+    FGD_STAT,
+    MOG,
+    MOG2,
+    GMG
 };
 
-//this is a sample for foreground detection functions
 int main(int argc, const char** argv)
 {
-    help();
+    cv::CommandLineParser cmd(argc, argv,
+        "{ c | camera | false       | use camera }"
+        "{ f | file   | 768x576.avi | input video file }"
+        "{ m | method | mog         | method (fgd, mog, mog2, gmg) }"
+        "{ h | help   | false       | print help message }");
 
-    CommandLineParser parser(argc, argv, keys);
-    bool useCamera = parser.get<bool>("camera");
-    string file = parser.get<string>("file_name");
+    if (cmd.get<bool>("help"))
+    {
+        cout << "Usage : bgfg_segm [options]" << endl;
+        cout << "Avaible options:" << endl;
+        cmd.printParams();
+        return 0;
+    }
+
+    bool useCamera = cmd.get<bool>("camera");
+    string file = cmd.get<string>("file");
+    string method = cmd.get<string>("method");
+
+    if (method != "fgd"
+        && method != "mog"
+        && method != "mog2"
+        && method != "gmg")
+    {
+        cerr << "Incorrect method" << endl;
+        return -1;
+    }
+
+    Method m = method == "fgd" ? FGD_STAT :
+               method == "mog" ? MOG :
+               method == "mog2" ? MOG2 :
+                                  GMG;
+
     VideoCapture cap;
-    bool update_bg_model = true;
 
-    if( useCamera )
+    if (useCamera)
         cap.open(0);
     else
-        cap.open(file.c_str());
-    parser.printParams();
+        cap.open(file);
 
-    if( !cap.isOpened() )
+    if (!cap.isOpened())
     {
-        printf("can not open camera or video file\n");
+        cerr << "can not open camera or video file" << endl;
         return -1;
+    }
+
+    Mat frame;
+    cap >> frame;
+
+    GpuMat d_frame(frame);
+
+    FGDStatModel fgd_stat;
+    MOG_GPU mog;
+    MOG2_GPU mog2;
+    GMG_GPU gmg;
+    gmg.numInitializationFrames = 40;
+
+    GpuMat d_fgmask;
+    GpuMat d_fgimg;
+    GpuMat d_bgimg;
+
+    Mat fgmask;
+    Mat fgimg;
+    Mat bgimg;
+
+    switch (m)
+    {
+    case FGD_STAT:
+        fgd_stat.create(d_frame);
+        break;
+
+    case MOG:
+        mog(d_frame, d_fgmask, 0.01f);
+        break;
+
+    case MOG2:
+        mog2(d_frame, d_fgmask);
+        break;
+
+    case GMG:
+        gmg.initialize(d_frame.size());
+        break;
     }
 
     namedWindow("image", WINDOW_NORMAL);
     namedWindow("foreground mask", WINDOW_NORMAL);
     namedWindow("foreground image", WINDOW_NORMAL);
-    namedWindow("mean background image", WINDOW_NORMAL);
-
-    BackgroundSubtractorMOG2 bg_model;//(100, 3, 0.3, 5);
-
-    Mat img, fgmask, fgimg;
+    if (m != GMG)
+    {
+        namedWindow("mean background image", WINDOW_NORMAL);
+    }
 
     for(;;)
     {
-        cap >> img;
-
-        if( img.empty() )
+        cap >> frame;
+        if (frame.empty())
             break;
+        d_frame.upload(frame);
 
-        //cvtColor(_img, img, COLOR_BGR2GRAY);
-
-        if( fgimg.empty() )
-          fgimg.create(img.size(), img.type());
+        int64 start = cv::getTickCount();
 
         //update the model
-        bg_model(img, fgmask, update_bg_model ? -1 : 0);
+        switch (m)
+        {
+        case FGD_STAT:
+            fgd_stat.update(d_frame);
+            d_fgmask = fgd_stat.foreground;
+            d_bgimg = fgd_stat.background;
+            break;
 
-        fgimg = Scalar::all(0);
-        img.copyTo(fgimg, fgmask);
+        case MOG:
+            mog(d_frame, d_fgmask, 0.01f);
+            mog.getBackgroundImage(d_bgimg);
+            break;
 
-        Mat bgimg;
-        bg_model.getBackgroundImage(bgimg);
+        case MOG2:
+            mog2(d_frame, d_fgmask);
+            mog2.getBackgroundImage(d_bgimg);
+            break;
 
-        imshow("image", img);
+        case GMG:
+            gmg(d_frame, d_fgmask);
+            break;
+        }
+
+        double fps = cv::getTickFrequency() / (cv::getTickCount() - start);
+        std::cout << "FPS : " << fps << std::endl;
+
+        d_fgimg.create(d_frame.size(), d_frame.type());
+        d_fgimg.setTo(Scalar::all(0));
+        d_frame.copyTo(d_fgimg, d_fgmask);
+
+        d_fgmask.download(fgmask);
+        d_fgimg.download(fgimg);
+        if (!d_bgimg.empty())
+            d_bgimg.download(bgimg);
+
+        imshow("image", frame);
         imshow("foreground mask", fgmask);
         imshow("foreground image", fgimg);
-        if(!bgimg.empty())
-          imshow("mean background image", bgimg );
+        if (!bgimg.empty())
+            imshow("mean background image", bgimg);
 
-        char k = (char)waitKey(30);
-        if( k == 27 ) break;
-        if( k == ' ' )
-        {
-            update_bg_model = !update_bg_model;
-            if(update_bg_model)
-                printf("Background update is on\n");
-            else
-                printf("Background update is off\n");
-        }
+        int key = waitKey(30);
+        if (key == 27)
+            break;
     }
 
     return 0;
