@@ -1,4 +1,4 @@
-#! usr/bin/python
+#! /usr/bin/python
 # PongClone- A Python and Pygame version of the classic arcade game.
  #   Copyright (C) 2011 T. S. Hayden Dennison
 #
